@@ -1,4 +1,5 @@
 // build by gcc -o wayland_clip -g -O0 -fpermissive wayland_clip.cpp `pkg-config --libs --cflags gtk+-wayland-3.0` -lwayland-client
+// run with WAYLAND_DEBUG=1
 
 #include <poll.h>
 #include <stdlib.h>
@@ -12,7 +13,7 @@ struct wl_display *display;
 struct wl_registry *registry;
 int data_device_manager_version;
 struct wl_data_device_manager *data_device_manager;
-struct wl_event_queue *wl_queue;
+struct wl_event_queue *queue;
 struct wl_data_device *data_device;
 struct wl_seat *seat;
 struct wl_data_offer *global_offer = NULL;
@@ -68,11 +69,11 @@ data_device_selection (void                  *data,
   
 int pipe_fd[2] = {0,0};
 
-static void
+static bool
 data_device_read_data (void)
 {
   if (!pipe_fd[0]) {
-    if (pipe2(pipe_fd, O_CLOEXEC|O_NONBLOCK) == -1)
+    if (pipe2(pipe_fd, O_NONBLOCK) == -1)
       return;
 
     wl_data_offer_receive (global_offer, "TEXT", pipe_fd[1]);
@@ -90,10 +91,10 @@ data_device_read_data (void)
     close(pipe_fd[0]);
     pipe_fd[0] = pipe_fd[1] = 0;
     global_offer = NULL;
+    fprintf(stderr, "Clipboard data: '%s' len = %d\n", buffer, len);
+    return true;
   }
-
-  if(len > 0)
-    fprintf(stderr, "Data: '%s' len = %d\n", buffer, len);
+  return false;
 }
 
 static void
@@ -177,48 +178,41 @@ static const struct wl_registry_listener registry_listener = {
 
 gint test_callback(gpointer dd)
 {
- char *data = NULL;
+ fprintf(stderr, "****************** test_callback\n");
 
-/* GTK Code	
-  GtkClipboard *clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-  char *data = gtk_clipboard_wait_for_text(clipboard);
-*/
-  GdkDisplay *gdkDisplay = gdk_display_get_default();
-  display = gdk_wayland_display_get_wl_display(gdkDisplay);
-  struct wl_registry *registry = wl_display_get_registry(display);
-//  wl_queue = wl_display_create_queue(display);
-//  wl_proxy_set_queue((struct wl_proxy *)registry, wl_queue);
-  wl_registry_add_listener(registry, &registry_listener, NULL);
+ struct pollfd fds;
+ fds.fd = wl_display_get_fd (display);
+ fds.events = POLLIN;
 
-//  wl_display_roundtrip_queue(display, wl_queue);
-  wl_display_roundtrip(display);
+ int clip_timeout = 100000;
+ gint64 start = g_get_monotonic_time();
 
-  if (data_device_manager == nullptr)
-      return(0);
-
-  GdkSeat *gdkseat = gdk_display_get_default_seat(gdkDisplay);
-  GdkDevice *device = gdk_seat_get_pointer(gdkseat);
-/*
-  struct wl_seat *seat = gdk_wayland_device_get_wl_seat(device);
-  wl_seat_add_listener(seat, &seat_listener, display);
-*/
-
-  data_device = wl_data_device_manager_get_data_device (data_device_manager, seat);
-  wl_data_device_add_listener(data_device, &data_device_listener, seat);
-
-  while (1) {
-      while (wl_display_prepare_read(display) != 0)
-           wl_display_dispatch_pending(display);
+ while (1) {
+      while (wl_display_prepare_read_queue(display, queue) != 0)
+          wl_display_dispatch_queue_pending(display, queue);
       wl_display_flush(display);
 
-      wl_display_read_events(display);
+      int timeout = (clip_timeout - (g_get_monotonic_time() - start))/1000;
+      if(timeout < 0)
+        break;
+
+       int ret = poll(&fds, 1, timeout);
+       if (ret == -1 || ret == 0) {
+          wl_display_cancel_read(display);
+          break;
+       }
+       else
+          wl_display_read_events(display);
+
+       wl_display_dispatch_queue_pending(display, queue);
+
       if(global_offer) {
-        data_device_read_data();
+        if(data_device_read_data())
+          break;
       }
   }
 
-  gtk_main_quit ();
-  return FALSE;
+  return TRUE;
 }
 
 
@@ -237,7 +231,25 @@ int main( int   argc,
 
     gtk_widget_show_all (GTK_WIDGET(window));
 
-    g_timeout_add (250, test_callback, 0);
+    display = wl_display_connect(NULL);
+    queue = wl_display_create_queue(display);
+
+    registry = wl_display_get_registry(display);
+    wl_proxy_set_queue((struct wl_proxy *)registry, queue);    
+    wl_registry_add_listener(registry, &registry_listener, NULL);
+
+    wl_display_roundtrip_queue(display, queue);
+
+    if (data_device_manager == nullptr)
+      return(0);
+
+    data_device = wl_data_device_manager_get_data_device (data_device_manager, seat);
+    wl_proxy_set_queue((struct wl_proxy *)data_device, queue);
+    wl_data_device_add_listener(data_device, &data_device_listener, seat);
+
+    wl_display_roundtrip_queue(display, queue);
+
+    g_timeout_add (1000, test_callback, 0);
 
     gtk_main ();
 
