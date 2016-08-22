@@ -2,6 +2,7 @@
 // run with WAYLAND_DEBUG=1
 
 #include <poll.h>
+#include <sys/epoll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -24,78 +25,42 @@ static void destroy( GtkWidget *widget,
     gtk_main_quit ();
 }
 
-static void
-data_device_leave (void                  *data,
-                   struct wl_data_device *data_device)
-{
-}
-
-static void
-data_device_motion (void                  *data,
-                    struct wl_data_device *data_device,
-                    uint32_t               time,
-                    wl_fixed_t             x,
-                    wl_fixed_t             y)
-{
-}
-
-static void
-data_device_drop (void                  *data,
-                  struct wl_data_device *data_device)
-{
-}
-
-
-static void
-data_device_enter (void                  *data,
-                   struct wl_data_device *data_device,
-                   uint32_t               serial,
-                   struct wl_surface     *surface,
-                   wl_fixed_t             x,
-                   wl_fixed_t             y,
-                   struct wl_data_offer  *offer)
-{
-}
+int pipe_fd[2] = {0, 0};
 
 static void
 data_device_selection (void                  *data,
                        struct wl_data_device *wl_data_device,
                        struct wl_data_offer  *offer)
 {
-  fprintf (stderr, "2. ****************** data_device_selection, data device %p, offer %p\n",
-           data_device, offer);
+  fprintf (stderr, "2. ****************** Setting offer %p\n", offer);
+  if(global_offer) {
+    wl_data_offer_destroy(global_offer);
+    global_offer = nullptr;
+  }
+
   global_offer = offer;
 }
   
-int pipe_fd[2] = {0,0};
-
 static bool
 data_device_read_data (void)
 {
-  if (!pipe_fd[0]) {
-    if (pipe2(pipe_fd, O_NONBLOCK) == -1)
-      return;
-
-    wl_data_offer_receive (global_offer, "TEXT", pipe_fd[1]);
-    wl_display_roundtrip(display);
-    close(pipe_fd[1]);
-  }
-
   int len;
   char buffer[4096] = "";
 
-  len = read(pipe_fd[0], buffer, sizeof(buffer));
-  if (len && len != -1) {
-    if (data_device_manager_version >= WL_DATA_OFFER_FINISH_SINCE_VERSION)
-      wl_data_offer_finish(global_offer);
-    close(pipe_fd[0]);
-    pipe_fd[0] = pipe_fd[1] = 0;
-    global_offer = NULL;
-    fprintf(stderr, "Clipboard data: '%s' len = %d\n", buffer, len);
-    return true;
+  fprintf(stderr, "Data read start...\n");
+  if(pipe_fd[0]) {
+    len = read(pipe_fd[0], buffer, sizeof(buffer));
+    if (len && len != -1) {
+      close(pipe_fd[0]);
+      close(pipe_fd[1]);
+      pipe_fd[0] = pipe_fd[1] = 0;
+      fprintf(stderr, "Clipboard data: '%s' len = %d\n", buffer, len);
+      return true;
+    }
   }
   return false;
 }
+
 
 static void
 data_offer_offer (void                 *data,
@@ -105,24 +70,12 @@ data_offer_offer (void                 *data,
   fprintf(stderr, "******************* data_offer_offer, type = %s\n",type);
 }
 
-static void
-data_offer_source_actions (void                 *data,
-                           struct wl_data_offer *wl_data_offer,
-                           uint32_t              source_actions)
-{
-}
-
-static void
-data_offer_action (void                 *data,
-                   struct wl_data_offer *wl_data_offer,
-                   uint32_t              action)
-{
-}
+static void data_offer_dump() {};
 
 static const struct wl_data_offer_listener data_offer_listener = {
   data_offer_offer,
-  data_offer_source_actions,
-  data_offer_action
+  data_offer_dump,
+  data_offer_dump
 };
 
 static void
@@ -135,12 +88,14 @@ data_device_data_offer (void                  *data,
   wl_data_offer_add_listener (offer, &data_offer_listener, NULL);
 }
 
+static void data_device_dump(void) {};
+
 static const struct wl_data_device_listener data_device_listener = {
   data_device_data_offer,
-  data_device_enter,
-  data_device_leave,
-  data_device_motion,
-  data_device_drop,
+  data_device_dump,
+  data_device_dump,
+  data_device_dump,
+  data_device_dump,
   data_device_selection
 };
 
@@ -175,46 +130,62 @@ static const struct wl_registry_listener registry_listener = {
     gdk_registry_handle_global_remove
 };
 
-
 gint test_callback(gpointer dd)
 {
  fprintf(stderr, "****************** test_callback\n");
 
- struct pollfd fds;
- fds.fd = wl_display_get_fd (display);
- fds.events = POLLIN;
-
  int clip_timeout = 100000;
  gint64 start = g_get_monotonic_time();
 
- while (1) {
-      while (wl_display_prepare_read_queue(display, queue) != 0)
-          wl_display_dispatch_queue_pending(display, queue);
-      wl_display_flush(display);
+ #define MAX_EVENTS 2
+ struct epoll_event ev, events[MAX_EVENTS];
 
-      int timeout = (clip_timeout - (g_get_monotonic_time() - start))/1000;
-      if(timeout < 0)
-        break;
+ int epollfd = epoll_create1(0);
+ if (epollfd == -1)
+   return FALSE;
 
-       int ret = poll(&fds, 1, timeout);
-       if (ret == -1 || ret == 0) {
-          wl_display_cancel_read(display);
-          break;
-       }
-       else
-          wl_display_read_events(display);
+ ev.events = EPOLLIN;
+ int display_fd = ev.data.fd = wl_display_get_fd(display);
+ if (epoll_ctl(epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1)
+   return FALSE;
 
-       wl_display_dispatch_queue_pending(display, queue);
+ bool clip_data = false;
+ while (!clip_data) {
+   if (global_offer && !pipe_fd[0]) {
+     if (pipe(pipe_fd) == -1)
+       return TRUE;
 
-      if(global_offer) {
-        if(data_device_read_data())
-          break;
+     wl_data_offer_receive(global_offer, "TEXT", pipe_fd[1]);
+     close(pipe_fd[1]);
+     ev.data.fd = pipe_fd[0];
+     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1)
+  	   return FALSE;
+    }
+
+    while (wl_display_prepare_read_queue(display, queue) != 0)
+        wl_display_dispatch_queue_pending(display, queue);
+    wl_display_flush(display);
+
+    int timeout = (clip_timeout - (g_get_monotonic_time() - start))/1000;
+    int nfds = epoll_wait(epollfd, events, MAX_EVENTS, timeout);
+    if (nfds == -1 || nfds == 0) {
+       wl_display_cancel_read(display);
+       fprintf(stderr, "Poll timeout\n");
+       break;
+    }
+
+    for (int i = 0; i < nfds; i++) {
+      if (events[i].data.fd == display_fd) {
+        wl_display_read_events(display);
+        wl_display_dispatch_queue_pending(display, queue);
+      } else {
+        clip_data = data_device_read_data();
       }
+    }
   }
 
   return TRUE;
 }
-
 
 int main( int   argc,
           char *argv[] )
@@ -231,7 +202,7 @@ int main( int   argc,
 
     gtk_widget_show_all (GTK_WIDGET(window));
 
-    display = wl_display_connect(NULL);
+    display = gdk_wayland_display_get_wl_display(gdk_display_get_default());
     queue = wl_display_create_queue(display);
 
     registry = wl_display_get_registry(display);
