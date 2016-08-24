@@ -9,6 +9,7 @@
 #include <gtk/gtk.h>
 #include <gdk/gdkwayland.h>
 #include <wayland-client.h>
+#include <errno.h>
 
 struct wl_display *display;
 struct wl_registry *registry;
@@ -25,14 +26,13 @@ static void destroy( GtkWidget *widget,
     gtk_main_quit ();
 }
 
-int pipe_fd[2] = {0, 0};
 
 static void
 data_device_selection (void                  *data,
                        struct wl_data_device *wl_data_device,
                        struct wl_data_offer  *offer)
 {
-  fprintf (stderr, "2. ****************** Setting offer %p\n", offer);
+  fprintf (stderr, "2. ****************** data_device_selection, offer %p\n", offer);
   if(global_offer) {
     wl_data_offer_destroy(global_offer);
     global_offer = nullptr;
@@ -41,26 +41,6 @@ data_device_selection (void                  *data,
   global_offer = offer;
 }
   
-static bool
-data_device_read_data (void)
-{
-  int len;
-  char buffer[4096] = "";
-
-  fprintf(stderr, "Data read start...\n");
-  if(pipe_fd[0]) {
-    len = read(pipe_fd[0], buffer, sizeof(buffer));
-    if (len && len != -1) {
-      close(pipe_fd[0]);
-      close(pipe_fd[1]);
-      pipe_fd[0] = pipe_fd[1] = 0;
-      fprintf(stderr, "Clipboard data: '%s' len = %d\n", buffer, len);
-      return true;
-    }
-  }
-  return false;
-}
-
 
 static void
 data_offer_offer (void                 *data,
@@ -130,10 +110,47 @@ static const struct wl_registry_listener registry_listener = {
     gdk_registry_handle_global_remove
 };
 
+int data_paste(void)
+{
+  if(!global_offer)
+    return;
+
+  int pipe_fd[2] = {0, 0};
+  if (pipe(pipe_fd) == -1)
+      return false;
+
+  wl_data_offer_receive(global_offer, "TEXT", pipe_fd[1]);
+  close(pipe_fd[1]);
+
+  wl_display_flush(display);
+
+  int len;
+  char buffer[4096] = "";
+
+  fprintf(stderr, "Data read start...\n");
+  len = read(pipe_fd[0], buffer, sizeof(buffer));
+  if (len && len != -1) {
+    close(pipe_fd[0]);
+    fprintf(stderr, "Clipboard data: '%s' len = %d\n", buffer, len);
+    return true;
+  }
+
+  return false;
+}
+
 gint test_callback(gpointer dd)
 {
- fprintf(stderr, "****************** test_callback\n");
+	/* Use a trick that Gdk polls and read events from
+     the Wayland display for us. We just need to direct them to 
+     our queue by wl_display_dispatch_queue_pending() call
+     which also dispatch our data_device handlers
+     and prepares the clipboard data if there's any.
+  */
 
+  wl_display_dispatch_queue_pending(display, queue);
+  if(data_paste())
+     return TRUE;
+/*
  int clip_timeout = 100000;
  gint64 start = g_get_monotonic_time();
 
@@ -149,42 +166,115 @@ gint test_callback(gpointer dd)
  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1)
    return FALSE;
 
- bool clip_data = false;
- while (!clip_data) {
-   if (global_offer && !pipe_fd[0]) {
-     if (pipe(pipe_fd) == -1)
-       return TRUE;
+ fprintf(stderr, "0\n");
 
-     wl_data_offer_receive(global_offer, "TEXT", pipe_fd[1]);
-     close(pipe_fd[1]);
-     ev.data.fd = pipe_fd[0];
-     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, ev.data.fd, &ev) == -1)
-  	   return FALSE;
-    }
-
-    while (wl_display_prepare_read_queue(display, queue) != 0)
+ while (!data_paste()) {
+    fprintf(stderr, "1\n");
+    while (wl_display_prepare_read_queue(display, queue) != 0) {
+        fprintf(stderr, "1.1\n");
         wl_display_dispatch_queue_pending(display, queue);
+        if(data_paste())
+          return TRUE;
+        fprintf(stderr, "1.2\n");
+    }
+    fprintf(stderr, "1.3\n");
     wl_display_flush(display);
+
+    fprintf(stderr, "2\n");
 
     int timeout = (clip_timeout - (g_get_monotonic_time() - start))/1000;
     int nfds = epoll_wait(epollfd, events, MAX_EVENTS, timeout);
+    fprintf(stderr, "3\n");
     if (nfds == -1 || nfds == 0) {
        wl_display_cancel_read(display);
+       fprintf(stderr, "4\n");
        fprintf(stderr, "Poll timeout\n");
        break;
     }
+
+    fprintf(stderr, "5\n");
 
     for (int i = 0; i < nfds; i++) {
       if (events[i].data.fd == display_fd) {
         wl_display_read_events(display);
         wl_display_dispatch_queue_pending(display, queue);
-      } else {
-        clip_data = data_device_read_data();
       }
     }
-  }
 
+    fprintf(stderr, "6\n");
+  }
+*/
   return TRUE;
+}
+
+typedef struct _GdkWaylandEventSource {
+  GSource source;
+  GPollFD pfd;
+  gboolean reading;
+  gboolean pending;
+} GdkWaylandEventSource;
+
+static gboolean
+gdk_event_source_prepare (GSource *base,
+                          gint    *timeout)
+{
+  *timeout = -1;
+  return TRUE;
+}
+
+static gboolean
+gdk_event_source_check (GSource *base)
+{
+  return TRUE;
+}
+
+static gboolean
+gdk_event_source_dispatch (GSource     *base,
+         GSourceFunc  callback,
+         gpointer     data)
+{
+  while (wl_display_prepare_read_queue(display, queue) != 0)
+       wl_display_dispatch_queue_pending(display, queue);
+  wl_display_flush(display);
+  wl_display_cancel_read(display);
+  return G_SOURCE_CONTINUE;
+}
+
+static void
+gdk_event_source_finalize (GSource *base)
+{
+}
+
+static GSourceFuncs wl_glib_source_funcs = {
+  gdk_event_source_prepare,
+  gdk_event_source_check,
+  gdk_event_source_dispatch,
+  gdk_event_source_finalize
+};
+
+GSource *
+_gdk_wayland_display_event_source_new()
+{
+  GSource *source;
+  GdkWaylandEventSource *wl_source;
+  char *name;
+
+  source = g_source_new (&wl_glib_source_funcs, sizeof (GdkWaylandEventSource));
+  name = g_strdup_printf ("Firefox Wayland Event source");
+  g_source_set_name (source, name);
+  g_free (name);
+
+  wl_source = (GdkWaylandEventSource *) source;
+
+  wl_source->pfd.fd = wl_display_get_fd (display);
+  wl_source->pfd.events = G_IO_IN | G_IO_ERR | G_IO_HUP;
+  g_source_add_poll (source, &wl_source->pfd);
+
+  g_source_set_priority (source, GDK_PRIORITY_EVENTS);
+  g_source_set_can_recurse (source, FALSE);
+  g_source_attach (source, NULL);
+
+  return source;
 }
 
 int main( int   argc,
