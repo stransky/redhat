@@ -53,7 +53,10 @@ data_offer_offer (void                 *data,
   fprintf(stderr, "******************* data_offer_offer, type = %s\n",type);
 }
 
-static void data_offer_dump() {};
+static void data_offer_dump()
+{
+  fprintf(stderr, "******************* data_offer_dump()\n");
+}
 
 static const struct wl_data_offer_listener data_offer_listener = {
   data_offer_offer,
@@ -71,7 +74,10 @@ data_device_data_offer (void                  *data,
   wl_data_offer_add_listener (offer, &data_offer_listener, NULL);
 }
 
-static void data_device_dump(void) {};
+static void data_device_dump(void)
+{
+  fprintf(stderr, "******************* data_device_dump()\n");
+}
 
 static const struct wl_data_device_listener data_device_listener = {
   data_device_data_offer,
@@ -94,7 +100,7 @@ keyboard_handle_enter(void *data, struct wl_keyboard *keyboard,
                       uint32_t serial, struct wl_surface *surface,
                       struct wl_array *keys)
 {
-	fprintf(stderr, "Focus in\n");
+    fprintf(stderr, "Focus in\n");
 }
 
 static void
@@ -104,8 +110,8 @@ keyboard_handle_leave(void *data, struct wl_keyboard *keyboard,
   fprintf(stderr, "Focus out\n");
   if(global_offer) {
     wl_data_offer_destroy(global_offer);
-  	global_offer = nullptr;
-		fprintf(stderr, "Offer cleared\n");
+    global_offer = nullptr;
+        fprintf(stderr, "Offer cleared\n");
   }
 }
 
@@ -138,11 +144,11 @@ seat_handle_capabilities(void *data, struct wl_seat *seat,
                          enum wl_seat_capability caps)
 {
     if (caps & WL_SEAT_CAPABILITY_KEYBOARD) {
-			keyboard = wl_seat_get_keyboard(seat);
-			wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
+            keyboard = wl_seat_get_keyboard(seat);
+            wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD)) {
-			wl_keyboard_destroy(keyboard);
-			keyboard = NULL;
+            wl_keyboard_destroy(keyboard);
+            keyboard = NULL;
     }
 }
 
@@ -185,33 +191,39 @@ static const struct wl_registry_listener registry_listener = {
 int data_paste(void)
 {
   if(!global_offer)
-    return;
+    return false;
 
   int pipe_fd[2] = {0, 0};
   if (pipe(pipe_fd) == -1)
       return false;
 
-  wl_data_offer_receive(global_offer, "TEXT", pipe_fd[1]);
+  wl_data_offer_receive(global_offer, "text/plain", pipe_fd[1]);
+  //wl_data_offer_receive(global_offer, "TEXT", pipe_fd[1]);
   close(pipe_fd[1]);
-
-	wl_display_flush(display);
+  wl_display_flush(display);
 
   int len;
   char buffer[4096] = "";
 
-  fprintf(stderr, "Read pipe = %d\n", pipe_fd[0]);
+  struct pollfd fds;
+  fds.fd = pipe_fd[0];
+  fds.events = POLLIN;
+
+  int ret = poll(&fds, 1, 200);
+  if (ret == -1 || ret == 0)
+    return false;
+
   len = read(pipe_fd[0], buffer, sizeof(buffer));
   if (len && len != -1) {
-    close(pipe_fd[0]);
-    pipe_fd[0] = 0;
     fprintf(stderr, "Clipboard data: '%s' len = %d\n", buffer, len);
     return true;
   }
   else {
-    int err = errno;
     perror("data_paste():");
-    fprintf(stderr, "read returns %d errno %d\n", len, err);
   }
+
+  close(pipe_fd[0]);
+  pipe_fd[0] = 0;
 
   return false;
 }
